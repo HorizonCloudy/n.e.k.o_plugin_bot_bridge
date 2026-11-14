@@ -86,7 +86,8 @@ def test_clean_plugin_reports_clean(tmp_path: Path) -> None:
     assert payload["clean"] and payload["dangerous"] == 0 and payload["findings"] == []
 
 
-def test_skips_node_modules_dotdirs_and_binary_suffixes(tmp_path: Path) -> None:
+def test_scans_node_modules_but_skips_vcs_and_non_source(tmp_path: Path) -> None:
+    """修复后契约：node_modules 不再是藏身处；.git / 非源码后缀仍跳过。"""
     root = _make_plugin(
         tmp_path,
         {
@@ -94,13 +95,14 @@ def test_skips_node_modules_dotdirs_and_binary_suffixes(tmp_path: Path) -> None:
             "node_modules/evil/index.js": "eval(1)\n",
             ".git/hooks/pre-commit.py": "eval(1)\n",
             "logo.png": "eval(1)\n",  # 非源码后缀
-            "data/state.json": "eval(1)\n",  # 数据目录 + 非源码后缀
+            "data/state.json": "eval(1)\n",  # 非源码后缀
         },
     )
     report = scan_plugin_dir(root)
-    assert report.clean, [item.as_dict() for item in report.findings]
-    assert report.files_scanned == 1  # 只有 main.py 进扫描
-
+    hits = {item.file for item in report.dangerous}
+    assert any("node_modules" in f for f in hits), [item.as_dict() for item in report.findings]
+    assert not any(".git" in f for f in hits)
+    assert report.files_scanned == 2  # main.py + node_modules/evil/index.js
 
 def test_file_count_limit_truncates(tmp_path: Path, monkeypatch: object) -> None:
     import bridge.security as security
@@ -114,15 +116,16 @@ def test_file_count_limit_truncates(tmp_path: Path, monkeypatch: object) -> None
     assert report.files_scanned == 3
 
 
-def test_oversized_file_skipped_with_warning(tmp_path: Path, monkeypatch: object) -> None:
+def test_oversized_file_scanned_head_and_flagged(tmp_path: Path, monkeypatch: object) -> None:
+    """修复后契约：超限文件前 10 字节照常审，盲区本身按 dangerous 亮灯。"""
     import bridge.security as security
 
     root = _make_plugin(tmp_path, {"big.py": "eval(1)\n" * 3})
     monkeypatch.setattr(security, "_MAX_FILE_BYTES", 10)  # type: ignore[attr-defined]
     report = security.scan_plugin_dir(root)
-    assert report.dangerous == []  # 没读进去，不能假装扫过
-    assert any("未扫描" in item.reason for item in report.warnings)
-
+    reasons = [item.reason for item in report.dangerous]
+    assert any("\u8d85\u8fc7\u626b\u63cf\u4e0a\u9650" in r for r in reasons), reasons
+    assert any("eval" in r for r in reasons), reasons
 
 def test_attribute_calls_are_not_dynamic_execution(tmp_path: Path) -> None:
     """回归：``re.compile`` / ``model.eval`` / ``matcher.exec`` 是正当代码，不能误报。"""

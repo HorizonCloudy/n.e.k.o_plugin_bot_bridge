@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,9 @@ class NEKOHostServices(HostServices):
         self._embedding_usage_id = str(self._settings.get("embedding_usage_id") or "embedding")
         self._llm_lock = threading.Lock()
         self._llm_client: object | None = None
+        # send_chat 固定窗口限流：每来源每分钟 N 条，0=不限（issue: 无限流刷屏）。
+        self._chat_rate = float(self._settings.get("chat_rate_limit_per_minute", 30) or 0)
+        self._chat_windows: dict[str, list[float]] = {}
 
     # ------------------------------------------------------------------ 基础
 
@@ -215,6 +219,19 @@ class NEKOHostServices(HostServices):
 
     # ------------------------------------------------------- 对话推送（出站）
 
+    def _chat_admit(self, key: str) -> bool:
+        """固定窗口限流：60 秒内每来源最多 chat_rate_limit_per_minute 条。"""
+        if self._chat_rate <= 0:
+            return True
+        now = time.monotonic()
+        window = self._chat_windows.setdefault(key, [now, 0.0])
+        if now - window[0] >= 60.0:
+            window[0], window[1] = now, 0.0
+        if window[1] >= self._chat_rate:
+            return False
+        window[1] += 1
+        return True
+
     async def send_chat(
         self,
         text: str,
@@ -231,6 +248,13 @@ class NEKOHostServices(HostServices):
             return False
         if len(body) > self._max_push_chars:
             body = body[: self._max_push_chars] + "…（已截断）"
+        if not self._chat_admit(source or self.plugin_id):
+            self.log(
+                "warning",
+                f"send_chat 限流：{source or self.plugin_id} 超过 {self._chat_rate:.0f} 条/分钟，本条丢弃",
+                source=source,
+            )
+            return False
         parts = [{"type": "text", "text": body}]
         resolved_visibility = list(visibility) if visibility is not None else list(self._default_visibility)
         resolved_visibility = [item for item in resolved_visibility if item in VISIBILITY_VALUES]

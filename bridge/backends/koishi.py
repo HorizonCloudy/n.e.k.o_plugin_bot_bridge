@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 import shutil
 import subprocess
 import threading
@@ -43,6 +45,21 @@ __all__ = ["BACKEND", "KoishiBackend"]
 
 SHIM_DIR = Path(__file__).resolve().parents[2] / "shims" / "koishi"
 _HOST_SCRIPT = "koishi-host.mjs"
+_NON_ALNUM = re.compile(r"[^A-Za-z0-9_-]")
+
+def _sanitize_identifier(raw: str) -> str:
+    """npm 包名里的 /@. 等一律换成 _：plugin_id 会被拼进数据/缓存目录路径。"""
+    return _NON_ALNUM.sub("_", str(raw or "").strip()).strip("_")
+
+_NODE_ENV_KEEP = {
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC",
+    "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "PROGRAMDATA",
+    "PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA", "APPDATA", "LANG", "NODE_PATH",
+}
+
+def _node_env() -> dict:
+    """只给 Node 子进程传启动必需的变量，其余（含各种 API key）一律剥离。"""
+    return {k: v for k, v in os.environ.items() if k.upper() in _NODE_ENV_KEEP}
 _SHIM_NODE_MODULES = SHIM_DIR / "node_modules"
 
 #: koishi 插件的身份标记（满足任一即认为是 koishi 插件）。
@@ -107,6 +124,7 @@ class _NodeProcess:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            env=_node_env(),
         )
         self._lock = threading.Lock()
         self._next_id = 0
@@ -166,9 +184,27 @@ class _NodeProcess:
                 self.ready_error = str(msg.get("message") or "未知错误")
                 self._ready_event.set()
             elif kind == "result":
-                self._resolve(int(msg.get("call_id") or 0), msg)
+                try:
+                    cid = int(msg.get("call_id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                self._resolve(cid, msg)
             elif kind == "call":
-                self._handle_host_call(msg)
+                try:
+                    self._handle_host_call(msg)
+                except (TypeError, ValueError):
+                    continue
+        # stdout EOF = Node 已退出：未完成请求全部判失败，别让调用方等满超时
+        self._flush_pending("Node 宿主已退出")
+
+    def _flush_pending(self, reason: str) -> None:
+        with self._lock:
+            pend, self._pending = self._pending, {}
+        for resolve in pend.values():
+            try:
+                resolve({"type": "result", "ok": False, "error": reason})
+            except Exception:  # noqa: BLE001 - 宿主循环可能已关闭
+                pass
 
     def _resolve(self, call_id: int, payload: dict[str, Any]) -> None:
         with self._lock:
@@ -290,9 +326,14 @@ class _NodeProcess:
         if self.proc.poll() is None:
             try:
                 self.proc.terminate()
+                self.proc.wait(3)
             except OSError:
                 pass
-
+            except subprocess.TimeoutExpired:
+                try:
+                    self.proc.kill()
+                except OSError:
+                    pass
 
 class UnsupportedMethodError(RuntimeError):
     pass
@@ -330,7 +371,7 @@ class KoishiBackend:
         package = _read_package_json(path)
         if not package or not _is_koishi_package(package):
             return None
-        name = str(package.get("name") or path.name)
+        name = _sanitize_identifier(str(package.get("name") or path.name)) or "koishi_plugin"
         return PluginManifest(
             path=path,
             plugin_id=name,

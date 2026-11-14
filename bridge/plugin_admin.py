@@ -233,14 +233,29 @@ class PluginAdminMixin:
 
         purged: list[str] = []
         if purge_state:
+            state_root_str = str(getattr(self._host, "data_root", "") or "")  # type: ignore[attr-defined]
+            state_root = Path(state_root_str).resolve(strict=False) if state_root_str else None
+
+            def _inside(p: Path) -> bool:
+                # 与删除插件目录同一闸门：状态目录必须落在数据根内
+                return state_root is not None and state_root in p.parents
+
             for label, directory in (
                 ("data", self._host.data_dir(plugin_id)),  # type: ignore[attr-defined]
                 ("cache", self._host.cache_dir(plugin_id)),  # type: ignore[attr-defined]
             ):
                 try:
-                    if Path(directory).exists():
-                        await asyncio.to_thread(shutil.rmtree, Path(directory), True)
-                        purged.append(f"{label}:{directory}")
+                    target_state = Path(directory).resolve(strict=False)
+                    if not _inside(target_state):
+                        self._host.log(  # type: ignore[attr-defined]
+                            "warning",
+                            f"拒绝清理越界的 {label} 目录：{target_state}",
+                            source="registry",
+                        )
+                        continue
+                    if target_state.exists():
+                        await asyncio.to_thread(shutil.rmtree, target_state, True)
+                        purged.append(f"{label}:{target_state}")
                 except Exception as exc:  # noqa: BLE001 — 状态清理失败不该让删除失败
                     self._host.log(  # type: ignore[attr-defined]
                         "warning",

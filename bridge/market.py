@@ -1359,9 +1359,10 @@ class Market:
             self._log("info", f"{entry.source}:{entry.plugin_id} 提示：{warning}")
 
         requires: tuple[str, ...] = ()
+        expected_sha256 = ""
         if entry.install_kind == "pypi-wheel":
             try:
-                plan, requires = await self._resolve_wheel_plan(entry, plan)
+                plan, requires, expected_sha256 = await self._resolve_wheel_plan(entry, plan)
             except MarketError as exc:
                 return self._fail(
                     entry, target, str(exc), code=getattr(exc, "code", "unsupported_install_kind")
@@ -1411,6 +1412,13 @@ class Market:
             )
 
         digest = hashlib.sha256(payload).hexdigest()
+        if expected_sha256 and digest != expected_sha256:
+            return self._fail(
+                entry,
+                target,
+                f"下载内容 sha256 与索引声明不符（期望 {expected_sha256[:16]}…，实际 {digest[:16]}…），拒绝解压",
+                code="archive_digest_mismatch",
+            )
         shape = _shape_for(entry.source, entry)
         try:
             files, warning, wheel_requires = await asyncio.to_thread(
@@ -1474,7 +1482,7 @@ class Market:
 
     async def _resolve_wheel_plan(
         self, entry: MarketEntry, plan: InstallPlan
-    ) -> tuple[InstallPlan, tuple[str, ...]]:
+    ) -> tuple[InstallPlan, tuple[str, ...], str]:
         """把 ``pypi-wheel`` 条目解析成一条 wheel 下载地址（并带回它声明的依赖）。"""
         project = _text(entry.raw.get("project_link")) or entry.plugin_id
         meta = await self._fetcher.get_json(f"https://pypi.org/pypi/{project}/json", timeout=self._timeout)
@@ -1503,7 +1511,8 @@ class Market:
             strip_prefix=True,
             warnings=tuple(warnings),
         )
-        return resolved, requires
+        digests = chosen.get("digests") if isinstance(chosen.get("digests"), Mapping) else {}
+        return resolved, requires, _text(digests.get("sha256")).strip().lower()
 
     # ------------------------------------------------------------ 内部：索引
 

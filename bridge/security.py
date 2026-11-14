@@ -12,8 +12,7 @@
   同行带 ``..`` 的 remove/unlink）——常见于正当代码，只亮灯不拦。
 
 边界（如实）：这是启发式 tripwire，不是沙箱，也扫不出混淆/编码后的恶意代码；
-运行时隔离仍然靠宿主。扫描只读，带体积/文件数上限，跳过 ``node_modules`` /
-``.git`` / 数据目录。
+运行时隔离仍然靠宿主。扫描只读，带体积/文件数上限；缓存与版本库目录跳过。
 
 配置见 ``[bridge.security_scan]``（``enabled`` / ``mode``，默认 ``report``）。
 """
@@ -30,8 +29,8 @@ __all__ = ["SecurityFinding", "SecurityReport", "scan_plugin_dir"]
 #: 只扫这些后缀的文本文件；其它（二进制/字体/媒体）跳过。
 _SCAN_SUFFIXES = frozenset({".py", ".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx"})
 
-#: 不进入扫描的目录名（依赖/版本库/数据缓存与桥自身状态）。
-_SKIP_DIRS = frozenset({"__pycache__", "node_modules", ".git", ".venv", "venv", "data", "cache", ".ruff_cache", ".pytest_cache"})
+#: 不进入扫描的目录名：仅缓存 / 虚拟环境 / 版本库。
+_SKIP_DIRS = frozenset({"__pycache__", ".git", ".venv", "venv", ".ruff_cache", ".pytest_cache"})
 
 #: 单文件扫描上限：超过按 1 MiB 截断读入（超长行/压缩过的 bundle 不硬啃）。
 _MAX_FILE_BYTES = 1 * 1024 * 1024
@@ -53,6 +52,9 @@ _PY_DANGEROUS: tuple[tuple[str, str], ...] = (
     (r"__import__\s*\(", "动态导入 __import__()"),
     (r"\bos\.system\s*\(", "创建子进程 os.system"),
     (r"\bsubprocess\.(?:Popen|run|call|check_\w+)\s*\(", "创建子进程 subprocess"),
+    (r"\bfrom\s+subprocess\s+import\b", "创建子进程 subprocess（from-import 形式）"),
+    (r"\bos\.popen\s*\(", "创建子进程 os.popen"),
+    (r"\bimportlib\.import_module\s*\(", "动态导入 importlib.import_module"),
     (r"\bpickle\.loads?\s*\(", "反序列化 pickle（可执行任意代码）"),
     (r"\bmarshal\.loads?\s*\(", "反序列化 marshal"),
     (r"\bctypes\.(?:CDLL|WinDLL|windll|oledll)\b", "原生库调用 ctypes"),
@@ -157,15 +159,16 @@ def _scan_one_file(path: Path, root: Path, report: SecurityReport) -> None:
     """扫描单个源文件；读不了/超限的按「如实标注」处理，绝不假装扫过。"""
     rel = str(path.relative_to(root))
     try:
-        if path.stat().st_size > _MAX_FILE_BYTES:
-            report.findings.append(
-                SecurityFinding("warning", rel, 0, f"文件超过 {_MAX_FILE_BYTES} 字节，未扫描")
-            )
-            return
-        text = path.read_text(encoding="utf-8", errors="replace")
+        oversized = path.stat().st_size > _MAX_FILE_BYTES
+        text = path.read_bytes()[:_MAX_FILE_BYTES].decode("utf-8", errors="replace")
     except OSError:
         return
     report.files_scanned += 1
+    if oversized:
+        # 盲区就是绕过点：超限文件只审了前 1 MiB，剩余部分按 dangerous 亮灯。
+        report.findings.append(
+            SecurityFinding("dangerous", rel, 0, f"文件超过扫描上限 {_MAX_FILE_BYTES} 字节，仅前段被审")
+        )
     _scan_text(rel, text, is_python=path.suffix.lower() in _PY_SUFFIXES, out=report.findings)
 
 

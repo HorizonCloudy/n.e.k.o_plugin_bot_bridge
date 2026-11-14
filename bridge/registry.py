@@ -158,11 +158,21 @@ class BridgeRegistry(PluginAdminMixin):
         # 加载第三方代码之前的唯一闸门：enforce 模式下高风险命中会在这里抛
         # PluginLoadError，由 start() 的单插件失败路径接住（continue_on_error 生效）。
         await self._security_check(manifest, key)
-        plugin = await asyncio.to_thread(backend.load, manifest, self._host)
+        # 超时保护（issue: 一个阻塞插件卡死整座桥）。to_thread 线程杀不掉，超时如实记录。
+        load_timeout = float(self.settings().get("load_timeout_seconds", 30.0) or 30.0)
+        try:
+            plugin = await asyncio.wait_for(
+                asyncio.to_thread(backend.load, manifest, self._host), load_timeout
+            )
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            raise PluginLoadError(key, f"backend.load() 超时（{load_timeout:.0f}s，线程可能仍在运行）") from exc
         if not isinstance(plugin, LoadedPlugin):
             raise PluginLoadError(key, "backend.load() did not return LoadedPlugin")
         plugin.loaded_at = time.time()
-        await backend.start(plugin)
+        try:
+            await asyncio.wait_for(backend.start(plugin), load_timeout)
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            raise PluginLoadError(key, f"backend.start() 超时（{load_timeout:.0f}s）") from exc
         plugin.started = True
         self._host.log(
             "info",
@@ -222,10 +232,14 @@ class BridgeRegistry(PluginAdminMixin):
 
     async def stop(self) -> None:
         """停止并卸载全部插件（逆序，尽量不影响仍在跑的插件）。"""
+        stop_timeout = float(self.settings().get("stop_timeout_seconds", 10.0) or 10.0)
         for key, plugin in reversed(list(self._plugins.items())):
             backend = self._backend_for(plugin.framework)
             try:
-                await backend.stop(plugin)
+                await asyncio.wait_for(backend.stop(plugin), stop_timeout)
+            except (TimeoutError, asyncio.TimeoutError):
+                self._plugin_errors[key] = f"stop timeout ({stop_timeout:.0f}s)"
+                self._host.log("warning", f"停止 {key} 超时（{stop_timeout:.0f}s）", source="registry")
             except Exception as exc:  # noqa: BLE001 — 停止失败要记录，但继续停其余的
                 error = describe_backend_error(exc)
                 self._plugin_errors[key] = f"stop failed: {error}"

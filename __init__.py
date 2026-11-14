@@ -933,6 +933,15 @@ class BotBridgePlugin(NekoAdapterPlugin):
             return Err(SdkError(f"安装失败（{source}:{plugin_id}）：{result.error}"))
         payload = result.to_payload()
         target_dir = str(payload.get("target_dir") or getattr(result, "target_dir", ""))
+        # 安全默认（issue: 装即加载）：新装插件先进禁用名单，再触发重载；
+        # 用户在面板确认扫描报告后手动启动。走既有持久化通道，重启后依然生效。
+        disabled_now = sorted(
+            {str(item).strip() for item in (self._settings.get("disabled_plugins") or []) if str(item).strip()}
+            | {str(plugin_id).strip(), Path(target_dir).name}
+        )
+        await self._persist_disabled(disabled_now)
+        payload["auto_enabled"] = False
+        payload["note"] = "新装插件默认已禁用：请在面板确认扫描报告后手动启动"
         reloaded = await self._reload_after_market(
             framework=str(source),
             plugin_id=str(plugin_id),

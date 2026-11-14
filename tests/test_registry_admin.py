@@ -43,6 +43,12 @@ class _AdminHost:
         self.lines: list[str] = []
         self._data = plugins_root.parent / "state"
 
+    @property
+    def data_root(self) -> Path:
+        """与 BridgeHost 同一契约：data_dir/cache_dir 必须落在这个根之下。"""
+        return self._data
+
+
     def log(self, level: str, message: str, *, source: str = "") -> None:
         self.lines.append(f"{level}: {source}: {message}")
 
